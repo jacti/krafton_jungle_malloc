@@ -54,8 +54,9 @@
 
 /* 
  * Alignment requirement in bytes (either 4 or 8) 
+  FIX : x86 -64 - >16
  */
-#define ALIGNMENT 8  
+#define ALIGNMENT 16  
 
 /* 
  * Maximum heap size in bytes 

@@ -16,10 +16,13 @@
 #include <float.h>
 #include <time.h>
 
+#include <stdint.h>
+
 #include "mm.h"
 #include "memlib.h"
 #include "fsecs.h"
 #include "config.h"
+#include <bits/getopt_core.h>
 
 /**********************
  * Constants and macros
@@ -31,7 +34,7 @@
 #define LINENUM(i) (i+5) /* cnvt trace request nums to linenums (origin 1) */
 
 /* Returns true if p is ALIGNMENT-byte aligned */
-#define IS_ALIGNED(p)  ((((unsigned int)(p)) % ALIGNMENT) == 0)
+#define IS_ALIGNED(p)  ((((uintptr_t)(p)) % ALIGNMENT) == 0)
 
 /****************************** 
  * The key compound data types 
@@ -138,7 +141,7 @@ static void app_error(char *msg);
 int main(int argc, char **argv)
 {
     int i;
-    char c;
+    int c;
     char **tracefiles = NULL;  /* null-terminated array of trace file names */
     int num_tracefiles = 0;    /* the number of traces in that array */
     trace_t *trace = NULL;     /* stores a single trace file in memory */
@@ -193,9 +196,10 @@ int main(int argc, char **argv)
         case 'h': /* Print this message */
 	    usage();
             exit(0);
-        default:
+        default: 
+		fprintf(stderr, "Invalid option: -%c (code: %d)\n", c, c);
 	    usage();
-            exit(1);
+			exit(1);
         }
     }
 	
@@ -223,6 +227,13 @@ int main(int argc, char **argv)
 	}
 	else if (*team.name2 != '\0')
 	    printf("Member 2 :%s:%s\n", team.name2, team.id2);
+	if (((*team.name3 != '\0') && (*team.id3 == '\0')) ||
+	    ((*team.name3 == '\0') && (*team.id3 != '\0'))) { 
+	    printf("ERROR.  You must fill in all or none of the team member 2 ID fields!\n");
+	    exit(1);
+	}
+	else if (*team.name3 != '\0')
+	    printf("Member 2 :%s:%s\n", team.name3, team.id3);
     }
 
     /* 
