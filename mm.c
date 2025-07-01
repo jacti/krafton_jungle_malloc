@@ -64,7 +64,7 @@ static unsigned ALIGNMENT = 1 << ALIGNBIT;
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size)     (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
 
-#define SIZE_T_SIZE     (ALIGN(sizeof(size_t)))
+// #define SIZE_T_SIZE     (ALIGN(sizeof(size_t)))
 
 #define CHUNK_SIZE      (4*(1<<10))     // 4KB
 
@@ -72,18 +72,33 @@ static unsigned ALIGNMENT = 1 << ALIGNBIT;
 
 static void* HEAD;
 
+static struct 
+{
+    /* data */
+};
+
 /* 
  * mm_init - initialize the malloc package.
  */
 // NOTE : 최초 힙 공간 설정
-//  prologue, epilogue 생성
 int mm_init(void)
 {
-   
+   // STEP 1 : 공간 시작 align 맞춰 패딩 넣기
+   // STEP 2 : segregate_list 초기화 -> NULL이면 리스트가 없는 것
+   // STEP 3 : 프롤로그, 에필로그 생성
 }
 
 // NOTE : 힙 영역 확장
 static void *expand_heap(size_t size)
+{
+    // STEP 1 : 
+}
+
+
+/*
+    NOTE : malloc 할 메모리 영역을 찾아서 반환
+*/
+static void *find_fit(size_t size)
 {
 }
 
@@ -91,11 +106,6 @@ static void *expand_heap(size_t size)
  * mm_malloc - Allocate a block by incrementing the brk pointer.
  *     Always allocate a block whose size is a multiple of the alignment.
  */
-
-static void *find_memory(size_t size)
-{
-}
-
 void *mm_malloc(size_t size)
 {
 }
