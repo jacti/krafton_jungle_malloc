@@ -102,7 +102,7 @@ static void mem_remove(FreeHeader *bp_header);
 static uintptr_t *expand_heap(size_t size);
 static unsigned short get_index(size_t asize);
 static uintptr_t *find_fit(size_t asize);
-static void split_free_block(FreeHeader *bp_header, size_t asize);
+static size_t split_free_block(FreeHeader *bp_header, size_t asize);
 
 /* 
  * mm_init - initialize the malloc package.
@@ -138,10 +138,14 @@ int mm_init(void)
     NOTE : Free list 앞에 추가하는 함수
 */
 static void push(FreeHeader* node){
+    if(node == 0x7ffff68ce208){
+        int a = 1;
+    }
     unsigned short index = get_index(GET_SIZE(node));
     FreeHeader* old_head = segregate_list[index];
     node->prev = NIL;
     node->next = old_head;
+    old_head ->prev = node;
     segregate_list[index] = node;
 }
 
@@ -186,6 +190,9 @@ static uintptr_t* expand_heap(size_t size)
     if(GET_ALIGN(prev_footer) == 0){
         header = (uintptr_t *)((char *)header - GET_SIZE(prev_footer));
         //  STEP 4-1 : 이전 블럭을 Free list에서 제거
+        if(header == 0x7ffff68ce208){
+                    printf("here");
+                }
         mem_remove((FreeHeader*)header);
         asize += GET_SIZE(prev_footer);
     }
@@ -215,6 +222,8 @@ static unsigned short get_index(size_t asize){
     if(asize & ((1<< (ALIGNBIT + index))-1)){
         index += 1;
     }
+    // 4KB 보다 큰놈들은 젤 마지막 Index
+    if(index >= SEGREGATE_LEN) index = SEGREGATE_LEN-1;
     return index;
 }
 
@@ -232,6 +241,9 @@ static uintptr_t *find_fit(size_t asize)
         // STEP 3 : 현재 segregate_list 안에서 NIL이 나올 때 까지 First fit 탐색
         while(header != NIL){
             if(GET_SIZE(header) >= asize){
+                if(header == 0x7ffff68ce208){
+                    printf("here");
+                }
                 mem_remove(header);
                 return (uintptr_t *)header;
             }
@@ -243,12 +255,12 @@ static uintptr_t *find_fit(size_t asize)
     return expand_heap(asize);
 }
 
-static void split_free_block(FreeHeader* bp_header, size_t asize)
+static size_t split_free_block(FreeHeader* bp_header, size_t asize)
 {
-    if(GET_SIZE(bp_header) >= asize + sizeof(FreeHeader) + WSIZE){
+    size_t bsize = GET_SIZE(bp_header);
+    if(bsize >= asize + sizeof(FreeHeader) + WSIZE){
         // STEP 1: 이전 헤더 수정
-        size_t old_size = GET_SIZE(bp_header);
-        PUT(bp_header->header, asize);
+        PUT(bp_header, asize);
 
         // STEP 2: Footer 추가
         uintptr_t* new_footer = ((char *)bp_header + asize - WSIZE);
@@ -256,14 +268,22 @@ static void split_free_block(FreeHeader* bp_header, size_t asize)
 
         // STEP 3 : 새 분할 블럭의 Header 추가
         FreeHeader * new_free_header = (FreeHeader *)(new_footer + 1);
-        new_free_header->header = PACK(old_size - asize,0);
+        new_free_header->header = PACK(bsize - asize,0);
 
         // STEP 4 : 새 분할 블럭의 Footer 수정
-        uintptr_t* footer = ((char *)bp_header + old_size - WSIZE);
+        uintptr_t* footer = ((char *)bp_header + bsize - WSIZE);
         PUT(footer,new_free_header->header);
 
         // STEP 5 : 새 분할 블럭을 free list에 추가
+        if(new_free_header == 0x7ffff68ce208){
+            printf("plz here");
+        }
         push(new_free_header);
+        // 최종 확정된 크기 반환
+        return asize;
+    }
+    else {
+        return bsize;
     }
 }
 
@@ -282,9 +302,14 @@ void *mm_malloc(size_t size)
         return NULL;
     }
     // STEP 3 : split
-    split_free_block((FreeHeader *)header, asize);
+    asize = split_free_block((FreeHeader *)header, asize);
     // STEP 4 : alloc
+    if (header == 0x7ffff68ce208){
+        printf("asdfasdf");
+    }
     PUT(header, PACK(asize,1));
+    uintptr_t *footer = NXT_BLK(header)-1;
+    PUT(footer, *header);
     
     return (void *)(header +1);
 }
@@ -297,6 +322,9 @@ static uintptr_t* coalesce(uintptr_t * header){
     // CASE 1 : 앞에 블럭이 free block이면
     uintptr_t *prev_header = PREV_BLK(header);
     if(GET_ALIGN(prev_header) == 0){
+        if(header == 0x7ffff68ce208){
+            printf("here2");
+        }
         mem_remove((FreeHeader*)prev_header);
         PUT(prev_header,PACK((GET_SIZE(prev_header)+GET_SIZE(header)),0));
         PUT(footer,*prev_header);
@@ -306,6 +334,9 @@ static uintptr_t* coalesce(uintptr_t * header){
     // CASE 2 : 뒤의 블럭이 free block 이면
     uintptr_t *nxt_header = NXT_BLK(header);
     if(GET_ALIGN(nxt_header) == 0){
+        if(header == 0x7ffff68ce208){
+                    printf("here3");
+                }
         mem_remove((FreeHeader*)nxt_header);
         PUT(header,PACK((GET_SIZE(nxt_header)+GET_SIZE(header)),0));
         uintptr_t* nxt_footer = NXT_BLK(nxt_header) - 1;
@@ -333,42 +364,91 @@ void mm_free(void *ptr)
 }
 
 /*
- * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
+ * mm_realloc - Reallocate a memory block.
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    // STEP 1 : asize 계산
-    size_t asize = ALIGN(size) + DWSIZE;
-    uintptr_t* header = GET_HEADER(ptr);
-    //  STEP 1-1 : size 변화가 없으면 return
-    if(GET_SIZE(header) == asize){
+    // Edge cases
+    if (ptr == NULL) {
+        return mm_malloc(size);
+    }
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    uintptr_t *header = GET_HEADER(ptr);
+    size_t old_size = GET_SIZE(header);
+    size_t asize = ALIGN(size + DWSIZE); // New required block size
+    if (asize < 2 * DWSIZE) {
+        asize = 2 * DWSIZE;
+    }
+
+    // Case 1: New size is smaller or equal. Shrink the block if possible.
+    if (old_size >= asize) {
+        size_t remainder = old_size - asize;
+        if (remainder >= (2 * DWSIZE)) {
+            // Shrink and split the block
+            PUT(header, PACK(asize, 1));
+            PUT((uintptr_t *)((char *)header + asize - WSIZE), PACK(asize, 1));
+            
+            // Create a new free block with the remainder
+            uintptr_t *next_header = (uintptr_t *)((char *)header + asize);
+            PUT(next_header, PACK(remainder, 0));
+            PUT((uintptr_t *)((char *)next_header + remainder - WSIZE), PACK(remainder, 0));
+            
+            // Free the new remainder block to coalesce it with the next one if possible
+            mm_free((void *)((char *)next_header + WSIZE));
+        }
+        // If the remainder is too small to be a new free block,
+        // do nothing. The block is slightly larger than needed, which is fine.
         return ptr;
     }
-    // STEP 2 : 주변 free 블록과 합침
-    header = coalesce(header);
-    // CASE 1 : 합친 블록이 asize보다 크면 memmove 후 리턴
-    void *new_ptr;
-    if(GET_SIZE(header) >= asize){
-        // STEP 3(1)-1 : 메모리 이동
-        new_ptr = (void *)(header + 1);
-        memmove(ptr,new_ptr,size);
-        // STEP 3(1)-2 : 블록 분리
-        split_free_block((FreeHeader *)header, asize);
-    }
-    // CASE 2 : asize 보다 작으면 새로 malloc하여 값 복사 후 free
-    else {
-        // STEP 3(2)-1 : malloc
-        new_ptr = mm_malloc(size);
-        if(new_ptr == NULL){
-            return NULL;
-        }
-        memcpy(ptr,new_ptr,size);
 
-        // STEP 3(2)-2 : align bit 0으로 바꾸기
-        *header &= ~1;
-        // STEP 3(2)-3 : free list에 추가
-        push((FreeHeader *)header);
+    // Case 2: New size is larger. Try to expand in-place by checking the next block.
+    uintptr_t *next_header = NXT_BLK(header);
+    size_t next_is_free = (GET_ALIGN(next_header) == 0);
+    size_t next_size = GET_SIZE(next_header);
+    
+    // Check if next block is free, not the epilogue, and provides enough space
+    if (next_is_free && (old_size + next_size >= asize)) {
+        mem_remove((FreeHeader *)next_header); // Remove the next block from free list
+        
+        size_t total_size = old_size + next_size;
+        size_t remainder = total_size - asize;
+
+        if (remainder >= (2 * DWSIZE)) {
+            // Expand and split
+            PUT(header, PACK(asize, 1));
+            PUT((uintptr_t *)((char *)header + asize - WSIZE), PACK(asize, 1));
+            
+            uintptr_t *new_free_header = (uintptr_t *)((char *)header + asize);
+            PUT(new_free_header, PACK(remainder, 0));
+            PUT((uintptr_t *)((char *)new_free_header + remainder - WSIZE), PACK(remainder, 0));
+            push((FreeHeader *)new_free_header);
+        } else {
+            // Expand and use the whole merged block
+            PUT(header, PACK(total_size, 1));
+            PUT((uintptr_t *)((char *)header + total_size - WSIZE), PACK(total_size, 1));
+        }
+        return ptr; // Data is already in place, just return the original pointer
     }
+
+    // Case 3: Can't expand in-place. Malloc a new block and copy data.
+    void *new_ptr = mm_malloc(size);
+    if (new_ptr == NULL) {
+        return NULL;
+    }
+    
+    // Copy data from the old block to the new block
+    size_t copy_size = old_size - DWSIZE; // Old payload size
+    if (size < copy_size) {
+        copy_size = size; // If new size is smaller, copy less data
+    }
+    memcpy(new_ptr, ptr, copy_size);
+    
+    // Free the old block
+    mm_free(ptr);
     
     return new_ptr;
 }
