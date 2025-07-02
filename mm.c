@@ -76,7 +76,7 @@ static unsigned ALIGNMENT = 1 << ALIGNBIT;
 
 #define PUT(p, v)       (*((uintptr_t *)p) = v)
 
-#define PACK(size, align)       (size || align)
+#define PACK(size, align)       (size | align)
 
 #define GET_HEADER(p)     ((uintptr_t *)((char *)p - WSIZE))
 
@@ -98,7 +98,7 @@ static FreeHeader** segregate_list;
 
 
 static void push(FreeHeader* node);
-static void remove(FreeHeader *bp_header);
+static void mem_remove(FreeHeader *bp_header);
 static uintptr_t *expand_heap(size_t size);
 static unsigned short get_index(size_t asize);
 static uintptr_t *find_fit(size_t asize);
@@ -112,7 +112,8 @@ int mm_init(void)
 {
    // STEP 1 : 공간 시작 align 맞춰 패딩 넣기
    uintptr_t heap_base = mem_heap_lo();
-   mem_sbrk((ALIGN(heap_base) - heap_base));
+   size_t first_align = ((heap_base + (ALIGNMENT -1)) / ALIGNMENT)*ALIGNMENT - heap_base;
+   mem_sbrk(first_align);
 
    // STEP 2 : segregate_list 생성
    segregate_list = mem_sbrk(sizeof(FreeHeader *) * 11);
@@ -130,7 +131,7 @@ int mm_init(void)
    for (int i = 0; i < SEGREGATE_LEN; i++){
     segregate_list[i] = NIL;
    }
-   
+   return 0;
 }
 
 /*
@@ -147,7 +148,7 @@ static void push(FreeHeader* node){
 /*
     NOTE : Free list에서 제거하는 함수
 */
-static void remove(FreeHeader* node){
+static void mem_remove(FreeHeader* node){
     FreeHeader* prev = node->prev;
     FreeHeader* next = node->next;
     prev->next = next;
@@ -185,7 +186,7 @@ static uintptr_t* expand_heap(size_t size)
     if(GET_ALIGN(prev_footer) == 0){
         header = (uintptr_t *)((char *)header - GET_SIZE(prev_footer));
         //  STEP 4-1 : 이전 블럭을 Free list에서 제거
-        remove((FreeHeader*)header);
+        mem_remove((FreeHeader*)header);
         asize += GET_SIZE(prev_footer);
     }
 
@@ -231,7 +232,7 @@ static uintptr_t *find_fit(size_t asize)
         // STEP 3 : 현재 segregate_list 안에서 NIL이 나올 때 까지 First fit 탐색
         while(header != NIL){
             if(GET_SIZE(header) >= asize){
-                remove(header);
+                mem_remove(header);
                 return (uintptr_t *)header;
             }
             header = header->next;
@@ -296,7 +297,7 @@ static uintptr_t* coalesce(uintptr_t * header){
     // CASE 1 : 앞에 블럭이 free block이면
     uintptr_t *prev_header = PREV_BLK(header);
     if(GET_ALIGN(prev_header) == 0){
-        remove((FreeHeader*)prev_header);
+        mem_remove((FreeHeader*)prev_header);
         PUT(prev_header,PACK((GET_SIZE(prev_header)+GET_SIZE(header)),0));
         PUT(footer,*prev_header);
         header = prev_header;
@@ -305,7 +306,7 @@ static uintptr_t* coalesce(uintptr_t * header){
     // CASE 2 : 뒤의 블럭이 free block 이면
     uintptr_t *nxt_header = NXT_BLK(header);
     if(GET_ALIGN(nxt_header) == 0){
-        remove((FreeHeader*)nxt_header);
+        mem_remove((FreeHeader*)nxt_header);
         PUT(header,PACK((GET_SIZE(nxt_header)+GET_SIZE(header)),0));
         uintptr_t* nxt_footer = NXT_BLK(nxt_header) - 1;
         PUT(nxt_footer,*header);
