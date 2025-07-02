@@ -8,7 +8,7 @@ HANDINDIR = /afs/cs.cmu.edu/academic/class/15213-f01/malloclab/handin
 
 CC = gcc
 # CFLAGS = -Wall -O2 -m32
-CFLAGS = -Wall -O2 -g
+CFLAGS = -Wall -O0 -g
 
 # Output directories
 OBJ_DIR = out/obj
