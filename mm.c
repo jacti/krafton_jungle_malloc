@@ -1,22 +1,7 @@
-/*
- * mm-naive.c - The fastest, least memory-efficient malloc package.
- * 
- * In this naive approach, a block is allocated by simply incrementing
- * the brk pointer.  A block is pure payload. There are no headers or
- * footers.  Blocks are never coalesced or reused. Realloc is
- * implemented directly using mm_malloc and mm_free.
- *
- * NOTE TO STUDENTS: Replace this header comment with your own header
- * comment that gives a high level description of your solution.
- */
 #include <stdio.h>
 #include <stdlib.h>
-#include <assert.h>
-#include <unistd.h>
-#include <string.h>
-
 #include <stdint.h>
-
+#include <string.h>
 #include "mm.h"
 #include "memlib.h"
 
@@ -28,427 +13,489 @@ team_t team = {
     /* Team name */
     "Team 4",
     /* First member's full name */
-    "김기래",
+    "a",
     /* First member's email address */
-    "jacti",
+    "a",
     /* Second member's full name (leave blank if none) */
-    "김동규",
+    "b",
     /* Second member's email address (leave blank if none) */
-    "nanamatz",
+    "b",
     /* Third member's full name (leave blank if none) */
-    "김수민",
+    "c",
     /* Third member's email address (leave blank if none) */
-    "SunowMin"
+    "c"
 };
 
-#if defined __x86_64__ && !defined __ILP32__
-    #define __WORDSIZE			64
-    /* FIX : x86-64 -> 16*/
-    #define ALIGNBIT            4
-    #define WSIZE               8
-    #define DWSIZE              16
-    typedef uint64_t            word_t;
-#else
-    #define __WORDSIZE			32
-    /* single word (4) or double word (8) alignment */
-    #define ALIGNBIT            3
-    #define WSIZE               4
-    #define DWSIZE              8
-    typedef uint32_t            word_t;
-#endif
+/* 기본 매크로 */
+#define WSIZE      8                   /* 헤더/푸터 크기 */
+#define DSIZE     16                   /* 더블 워드 크기 */
+#define ALIGNMENT 16
+#define ALIGN(sz) (((sz) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
+#define PACK(sz,al) ((sz) | (al))
 
-static unsigned ALIGNMENT = 1 << ALIGNBIT;
+#define GET(p)       (*(uintptr_t *)(p))
+#define PUT(p,val)   (*(uintptr_t *)(p) = (val))
+#define GET_SIZE(p)  (GET(p) & ~0xF)
+#define GET_ALLOC(p) (GET(p) & 0x1)
 
-#define SIZEBIT             (__WORDSIZE - ALIGNBIT)
+#define HDRP(bp)     ((char*)(bp) - WSIZE)
+#define FTRP(bp)     ((char*)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+#define NEXT_BLKP(bp) ((char*)(bp) + GET_SIZE(((char*)(bp) - WSIZE)))
+#define PREV_BLKP(bp) ((char*)(bp) - GET_SIZE(((char*)(bp) - DSIZE)))
 
-/* rounds up to the nearest multiple of ALIGNMENT */
-#define ALIGN(size)     (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
+#define CHUNKSIZE  (1<<12)
+#define MAX(a,b)   ((a) > (b) ? (a) : (b))
 
-// #define SIZE_T_SIZE     (ALIGN(sizeof(size_t)))
+/* 포인터 압축: 상위 32비트는 모두 같으므로 저장 안 함 */
+static uintptr_t upper_32;
+#define PTR_TO_UINT(p)  ((uint32_t)(uintptr_t)(p))
+#define UINT_TO_PTR(u)  ((void*)((uintptr_t)upper_32 | (u)))
 
-#define CHUNK_SIZE      (4*(1<<10))     // 4KB
+typedef enum { RED=0, BLACK=1 } color_t;
 
-#define MAX(a,b)       (a >= b ? a : b)
+/* free-block payload: 16바이트 (32비트 포인터 3개 + color) */
+typedef struct {
+    uint32_t parent, left, right;
+    color_t  color;
+} RBNode;
 
-#define GET_SIZE(p)     (*((uintptr_t *)p) & ~(ALIGNMENT -1 ))
+static RBNode *root, *NIL;
 
-#define GET_ALIGN(p)    (*((uintptr_t *)p) & 1)
+/* 내부 함수 프로토타입 */
+static void *extend_heap(size_t words);
+static void *coalesce(void *bp);
+static void *find_fit(size_t asize);
+static void  place(void *bp, size_t asize);
 
-#define PUT(p, v)       (*((uintptr_t *)p) = v)
+static void  rb_insert(RBNode *z);
+static void  insert_fixup(RBNode *z);
+static void  left_rotate(RBNode *x);
+static void  right_rotate(RBNode *x);
+static void  remove_node(RBNode *z);
+static void  rb_transplant(RBNode *u, RBNode *v);
+static void  delete_fixup(RBNode *x);
 
-#define PACK(size, align)       (size | align)
+/*-------------------------------------------------------------
+ * mm_init
+ *    – prologue를 sentinel(NIL)로 쓰고, 초기 힙 확장
+ *-------------------------------------------------------------*/
+int mm_init(void) {
+    /* 충분한 공간 확보: 정렬 패딩 + prologue(32B) + epilogue(8B) */
+    if (mem_sbrk(ALIGNMENT + 2*DSIZE + WSIZE) == (void*)-1)
+        return -1;
 
-#define GET_HEADER(p)     ((uintptr_t *)((char *)p - WSIZE))
+    /* 힙 시작 주소와 보정 */
+    char *base = (char*)mem_heap_lo();
+    size_t pad = (ALIGNMENT - ((uintptr_t)base % ALIGNMENT)) % ALIGNMENT;
+    char *bp = base + pad + WSIZE;  /* bp는 prologue payload 시작 */
 
-#define NXT_BLK(p)      ((uintptr_t *)((char *)p + GET_SIZE((uintptr_t*)p)))
+    /* 상위 32비트 캐시 */
+    upper_32 = ((uintptr_t)bp) & ~0xFFFFFFFFu;
 
-#define PREV_BLK(p)     ((uintptr_t *)((char *)p - GET_SIZE(((uintptr_t*)p - 1))))
+    /* prologue 블록 헤더/푸터 (크기=32, 할당됨) */
+    PUT(bp - WSIZE, PACK(2*DSIZE,1));
+    PUT(bp + DSIZE,  PACK(2*DSIZE,1));
+    /* epilogue 헤더 */
+    PUT(bp + 2*DSIZE, PACK(0,1));
 
-#define SEGREGATE_LEN       11
+    /* NIL(=prologue) 초기화 */
+    NIL = (RBNode*)bp;
+    NIL->parent = PTR_TO_UINT(NIL);
+    NIL->left   = PTR_TO_UINT(NIL);
+    NIL->right  = PTR_TO_UINT(NIL);
+    NIL->color  = BLACK;
+    root = NIL;
 
-typedef struct  _Header
-{
-    uintptr_t header;
-    struct _Header *prev;
-    struct _Header *next;
-} FreeHeader;
-
-static FreeHeader* NIL;
-static FreeHeader** segregate_list;
-
-
-static void push(FreeHeader* node);
-static void mem_remove(FreeHeader *bp_header);
-static uintptr_t *expand_heap(size_t size);
-static unsigned short get_index(size_t asize);
-static uintptr_t *find_fit(size_t asize);
-static size_t split_free_block(FreeHeader *bp_header, size_t asize);
-
-/* 
- * mm_init - initialize the malloc package.
- */
-// NOTE : 최초 힙 공간 설정
-int mm_init(void)
-{
-   // STEP 1 : 공간 시작 align 맞춰 패딩 넣기
-   uintptr_t heap_base = mem_heap_lo();
-   size_t first_align = ((heap_base + (ALIGNMENT -1)) / ALIGNMENT)*ALIGNMENT - heap_base;
-   mem_sbrk(first_align);
-
-   // STEP 2 : segregate_list 생성
-   segregate_list = mem_sbrk(sizeof(FreeHeader *) * 11);
-
-   // STEP 3 : 프롤로그, 에필로그 생성
-   FreeHeader *prologue = mem_sbrk(sizeof(FreeHeader) + WSIZE);
-   prologue->header = PACK((sizeof(FreeHeader) + WSIZE),1);
-   NIL = prologue;  //NIL 등록
-   PUT((prologue +1),prologue->header); //Footer 등록
-
-   uintptr_t* epilogue = mem_sbrk(WSIZE);
-   PUT(epilogue, PACK(0,1));
-
-   // STEP 4 : segregate_list 초기화
-   for (int i = 0; i < SEGREGATE_LEN; i++){
-    segregate_list[i] = NIL;
-   }
-   return 0;
+    /* 첫 빈 블록 */
+    if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
+        return -1;
+    return 0;
 }
 
-/*
-    NOTE : Free list 앞에 추가하는 함수
-*/
-static void push(FreeHeader* node){
-    if(node == 0x7ffff68ce208){
-        int a = 1;
-    }
-    unsigned short index = get_index(GET_SIZE(node));
-    FreeHeader* old_head = segregate_list[index];
-    node->prev = NIL;
-    node->next = old_head;
-    old_head ->prev = node;
-    segregate_list[index] = node;
+/*-------------------------------------------------------------
+ * extend_heap
+ *-------------------------------------------------------------*/
+static void *extend_heap(size_t words) {
+    size_t size = (words%2) ? (words+1)*WSIZE : words*WSIZE;
+    char *bp0 = mem_sbrk(size);
+    if (bp0 == (void*)-1) return NULL;
+
+    /* 새로 만든 빈 블록 헤더/푸터 + 새로운 epilogue */
+    PUT(bp0,               PACK(size,0));
+    PUT(bp0 + size - WSIZE, PACK(size,0));
+    PUT(bp0 + size,         PACK(0,1));
+
+    return coalesce(bp0 + WSIZE);
 }
 
-/*
-    NOTE : Free list에서 제거하는 함수
-*/
-static void mem_remove(FreeHeader* node){
-    FreeHeader* prev = node->prev;
-    FreeHeader* next = node->next;
-    prev->next = next;
-    next->prev = prev;
+/*-------------------------------------------------------------
+ * coalesce: 인접 빈 블록과 합치고, RB-트리에 삽입
+ *-------------------------------------------------------------*/
+static void *coalesce(void *bp) {
+    size_t prev_alloc = GET_ALLOC((char*)bp - DSIZE);
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    size_t size = GET_SIZE(HDRP(bp));
 
-    // ! 만약 prev 가 NIL이면 Free list의 HEAD이기 때문에 새 HEAD 등록
-    if(prev == NIL){
-        unsigned short index = get_index(GET_SIZE(node));
-        segregate_list[index] = next;
+    if (!prev_alloc && !next_alloc) {
+        remove_node((RBNode*)NEXT_BLKP(bp));
+        remove_node((RBNode*)PREV_BLKP(bp));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + 
+                GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        bp = PREV_BLKP(bp);
     }
+    else if (!prev_alloc) {
+        remove_node((RBNode*)PREV_BLKP(bp));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        bp = PREV_BLKP(bp);
+    }
+    else if (!next_alloc) {
+        remove_node((RBNode*)NEXT_BLKP(bp));
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    }
+
+    PUT(HDRP(bp), PACK(size,0));
+    PUT(FTRP(bp), PACK(size,0));
+
+    /* RB-트리에 삽입 */
+    RBNode *node = (RBNode*)bp;
+    node->parent = PTR_TO_UINT(NIL);
+    node->left   = PTR_TO_UINT(NIL);
+    node->right  = PTR_TO_UINT(NIL);
+    node->color  = RED;
+    rb_insert(node);
+
+    return bp;
 }
 
-// NOTE : 힙 영역 확장
-static uintptr_t* expand_heap(size_t size)
-{
-    // STEP 1 : asize 계산
-    //      STEP 1-1 : CHUNKSIZE와 size 중 더 큰거 + align 고려
-    size_t asize = MAX(CHUNK_SIZE, size);
-
-    // STEP 2 : heap 확장
-    void *old_brk = mem_sbrk(asize);
-    // !mem_sbrk가 -1 리턴하면 확장 불가능이므로 NULL 반환
-    if(old_brk == (void *)-1){
-        return NULL;
+/*-------------------------------------------------------------
+ * mm_malloc
+ *-------------------------------------------------------------*/
+void *mm_malloc(size_t size) {
+    if (size == 0) return NULL;
+    size_t asize = ALIGN(size + WSIZE);
+    RBNode *fit = find_fit(asize);
+    if (fit) {
+        place(fit, asize);
+        return (void*)fit;
     }
-
-    // STEP 3 : 새 epilogue 생성
-    uintptr_t* epilogue = (mem_sbrk(0) - WSIZE);
-    PUT(epilogue, PACK(0,1));
-
-    // STEP 4 : 이전 block 연결
-    uintptr_t* header = GET_HEADER(old_brk);
-    uintptr_t* prev_footer = header -1;
-
-    if(GET_ALIGN(prev_footer) == 0){
-        header = (uintptr_t *)((char *)header - GET_SIZE(prev_footer));
-        //  STEP 4-1 : 이전 블럭을 Free list에서 제거
-        if(header == 0x7ffff68ce208){
-                    printf("here");
-                }
-        mem_remove((FreeHeader*)header);
-        asize += GET_SIZE(prev_footer);
-    }
-
-    // STEP 5 : header, footer 업데이트
-    PUT(header,PACK(asize,0));
-    PUT((epilogue -1), *header);
-
-    return header;
+    size_t extend = MAX(asize, CHUNKSIZE);
+    void *bp = extend_heap(extend/WSIZE);
+    if (!bp) return NULL;
+    place(bp, asize);
+    return bp;
 }
 
-/*
-    NOTE : size가 들어갈 index 계산
-*/
-static unsigned short get_index(size_t asize){
-    size_t s = asize;
-    s >>= ALIGNBIT + 1;
-    unsigned short index = 0;
-    
-    // 가장 앞 1 비트의 자리 - align
-    while(s > 0){
-        index +=1;
-        s >>= 1;
-    }
-    
-    // 뒤쪽에 나머지가 있으면 index + 1
-    if(asize & ((1<< (ALIGNBIT + index))-1)){
-        index += 1;
-    }
-    // 4KB 보다 큰놈들은 젤 마지막 Index
-    if(index >= SEGREGATE_LEN) index = SEGREGATE_LEN-1;
-    return index;
+/*-------------------------------------------------------------
+ * mm_free
+ *-------------------------------------------------------------*/
+void mm_free(void *ptr) {
+    if (!ptr) return;
+    size_t size = GET_SIZE(HDRP(ptr));
+    PUT(HDRP(ptr),       PACK(size,0));
+    PUT(FTRP(ptr),       PACK(size,0));
+    RBNode *node = (RBNode*)ptr;
+    node->parent = PTR_TO_UINT(NIL);
+    node->left   = PTR_TO_UINT(NIL);
+    node->right  = PTR_TO_UINT(NIL);
+    node->color  = RED;
+    rb_insert(node);
+    coalesce(ptr);
 }
 
-
-/*
-    NOTE : malloc 할 메모리 영역을 찾아서 반환
-*/
-static uintptr_t *find_fit(size_t asize)
-{
-    FreeHeader *header;
-    // STEP 1 : segregate_list 에서 검색해볼 index 계산
-    for(unsigned short index = get_index(asize); index < SEGREGATE_LEN; index ++){
-        // STEP 2 : 현재 리스트에서 내 크기를 못찾으면 다음 크기로 넘어감
-        header = segregate_list[index];
-        // STEP 3 : 현재 segregate_list 안에서 NIL이 나올 때 까지 First fit 탐색
-        while(header != NIL){
-            if(GET_SIZE(header) >= asize){
-                if(header == 0x7ffff68ce208){
-                    printf("here");
-                }
-                mem_remove(header);
-                return (uintptr_t *)header;
-            }
-            header = header->next;
-        }
-    }
-
-    // 위 리스트에서 못찾았으면 힙 확장
-    return expand_heap(asize);
-}
-
-static size_t split_free_block(FreeHeader* bp_header, size_t asize)
-{
-    size_t bsize = GET_SIZE(bp_header);
-    if(bsize >= asize + sizeof(FreeHeader) + WSIZE){
-        // STEP 1: 이전 헤더 수정
-        PUT(bp_header, asize);
-
-        // STEP 2: Footer 추가
-        uintptr_t* new_footer = ((char *)bp_header + asize - WSIZE);
-        PUT(new_footer,bp_header->header);
-
-        // STEP 3 : 새 분할 블럭의 Header 추가
-        FreeHeader * new_free_header = (FreeHeader *)(new_footer + 1);
-        new_free_header->header = PACK(bsize - asize,0);
-
-        // STEP 4 : 새 분할 블럭의 Footer 수정
-        uintptr_t* footer = ((char *)bp_header + bsize - WSIZE);
-        PUT(footer,new_free_header->header);
-
-        // STEP 5 : 새 분할 블럭을 free list에 추가
-        if(new_free_header == 0x7ffff68ce208){
-            printf("plz here");
-        }
-        push(new_free_header);
-        // 최종 확정된 크기 반환
-        return asize;
-    }
-    else {
-        return bsize;
-    }
-}
-
-/* 
- * mm_malloc - Allocate a block by incrementing the brk pointer.
- *     Always allocate a block whose size is a multiple of the alignment.
- */
-void *mm_malloc(size_t size)
-{
-    // STEP 1 : align
-    size_t asize = ALIGN(size) + DWSIZE;
-    // STEP 2 : find fitted memory
-    uintptr_t * header = find_fit(asize);
-    // STEP 2-1 : find 하지 못하면 malloc 못하는 상태 return NULL
-    if(header == NULL){
-        return NULL;
-    }
-    // STEP 3 : split
-    asize = split_free_block((FreeHeader *)header, asize);
-    // STEP 4 : alloc
-    if (header == 0x7ffff68ce208){
-        printf("asdfasdf");
-    }
-    PUT(header, PACK(asize,1));
-    uintptr_t *footer = NXT_BLK(header)-1;
-    PUT(footer, *header);
-    
-    return (void *)(header +1);
-}
-
-/*
-    NOTE : 앞 뒤의 free block과 연결
-*/
-static uintptr_t* coalesce(uintptr_t * header){
-    uintptr_t *footer = NXT_BLK(header) - 1;
-    // CASE 1 : 앞에 블럭이 free block이면
-    uintptr_t *prev_header = PREV_BLK(header);
-    if(GET_ALIGN(prev_header) == 0){
-        if(header == 0x7ffff68ce208){
-            printf("here2");
-        }
-        mem_remove((FreeHeader*)prev_header);
-        PUT(prev_header,PACK((GET_SIZE(prev_header)+GET_SIZE(header)),0));
-        PUT(footer,*prev_header);
-        header = prev_header;
-    }
-
-    // CASE 2 : 뒤의 블럭이 free block 이면
-    uintptr_t *nxt_header = NXT_BLK(header);
-    if(GET_ALIGN(nxt_header) == 0){
-        if(header == 0x7ffff68ce208){
-                    printf("here3");
-                }
-        mem_remove((FreeHeader*)nxt_header);
-        PUT(header,PACK((GET_SIZE(nxt_header)+GET_SIZE(header)),0));
-        uintptr_t* nxt_footer = NXT_BLK(nxt_header) - 1;
-        PUT(nxt_footer,*header);
-        footer = nxt_footer;
-    }
-
-    return header;
-}
-
-/*
- * mm_free - Freeing a block does nothing.
- */
-void mm_free(void *ptr)
-{
-    // STEP 1 : 앞뒤 연결하기
-    uintptr_t * header = coalesce(GET_HEADER(ptr));
-
-    // STEP 2 : align bit 0으로 바꾸기
-    *header &= ~1;
-
-    // STEP 3 : segregate_list에 추가하기
-    push((FreeHeader *)header);
-
-}
-
-/*
- * mm_realloc - Reallocate a memory block.
- */
-void *mm_realloc(void *ptr, size_t size)
-{
-    // Edge cases
-    if (ptr == NULL) {
-        return mm_malloc(size);
-    }
-    if (size == 0) {
-        mm_free(ptr);
-        return NULL;
-    }
-
-    uintptr_t *header = GET_HEADER(ptr);
-    size_t old_size = GET_SIZE(header);
-    size_t asize = ALIGN(size + DWSIZE); // New required block size
-    if (asize < 2 * DWSIZE) {
-        asize = 2 * DWSIZE;
-    }
-
-    // Case 1: New size is smaller or equal. Shrink the block if possible.
-    if (old_size >= asize) {
-        size_t remainder = old_size - asize;
-        if (remainder >= (2 * DWSIZE)) {
-            // Shrink and split the block
-            PUT(header, PACK(asize, 1));
-            PUT((uintptr_t *)((char *)header + asize - WSIZE), PACK(asize, 1));
-            
-            // Create a new free block with the remainder
-            uintptr_t *next_header = (uintptr_t *)((char *)header + asize);
-            PUT(next_header, PACK(remainder, 0));
-            PUT((uintptr_t *)((char *)next_header + remainder - WSIZE), PACK(remainder, 0));
-            
-            // Free the new remainder block to coalesce it with the next one if possible
-            mm_free((void *)((char *)next_header + WSIZE));
-        }
-        // If the remainder is too small to be a new free block,
-        // do nothing. The block is slightly larger than needed, which is fine.
-        return ptr;
-    }
-
-    // Case 2: New size is larger. Try to expand in-place by checking the next block.
-    uintptr_t *next_header = NXT_BLK(header);
-    size_t next_is_free = (GET_ALIGN(next_header) == 0);
-    size_t next_size = GET_SIZE(next_header);
-    
-    // Check if next block is free, not the epilogue, and provides enough space
-    if (next_is_free && (old_size + next_size >= asize)) {
-        mem_remove((FreeHeader *)next_header); // Remove the next block from free list
-        
-        size_t total_size = old_size + next_size;
-        size_t remainder = total_size - asize;
-
-        if (remainder >= (2 * DWSIZE)) {
-            // Expand and split
-            PUT(header, PACK(asize, 1));
-            PUT((uintptr_t *)((char *)header + asize - WSIZE), PACK(asize, 1));
-            
-            uintptr_t *new_free_header = (uintptr_t *)((char *)header + asize);
-            PUT(new_free_header, PACK(remainder, 0));
-            PUT((uintptr_t *)((char *)new_free_header + remainder - WSIZE), PACK(remainder, 0));
-            push((FreeHeader *)new_free_header);
-        } else {
-            // Expand and use the whole merged block
-            PUT(header, PACK(total_size, 1));
-            PUT((uintptr_t *)((char *)header + total_size - WSIZE), PACK(total_size, 1));
-        }
-        return ptr; // Data is already in place, just return the original pointer
-    }
-
-    // Case 3: Can't expand in-place. Malloc a new block and copy data.
-    void *new_ptr = mm_malloc(size);
-    if (new_ptr == NULL) {
-        return NULL;
-    }
-    
-    // Copy data from the old block to the new block
-    size_t copy_size = old_size - DWSIZE; // Old payload size
-    if (size < copy_size) {
-        copy_size = size; // If new size is smaller, copy less data
-    }
-    memcpy(new_ptr, ptr, copy_size);
-    
-    // Free the old block
+/*-------------------------------------------------------------
+ * mm_realloc
+ *-------------------------------------------------------------*/
+void *mm_realloc(void *ptr, size_t size) {
+    if (!ptr) return mm_malloc(size);
+    if (size == 0) { mm_free(ptr); return NULL; }
+    void *newp = mm_malloc(size);
+    if (!newp) return NULL;
+    size_t copy = GET_SIZE(HDRP(ptr)) - WSIZE;
+    if (size < copy) copy = size;
+    memcpy(newp, ptr, copy);
     mm_free(ptr);
-    
-    return new_ptr;
+    return newp;
+}
+
+/*-------------------------------------------------------------
+ * find_fit: best-fit 탐색
+ *-------------------------------------------------------------*/
+static void *find_fit(size_t asize) {
+    RBNode *x = root, *best = NIL;
+    while (x != NIL) {
+        size_t sz = GET_SIZE(HDRP(x));
+        if (sz == asize) { best = x; break; }
+        if (sz > asize) {
+            best = x;
+            x = (RBNode*)UINT_TO_PTR(x->left);
+        } else {
+            x = (RBNode*)UINT_TO_PTR(x->right);
+        }
+    }
+    return best!=NIL ? (void*)best : NULL;
+}
+
+/*-------------------------------------------------------------
+ * place: 블록 분할 & 할당
+ *-------------------------------------------------------------*/
+static void place(void *bp, size_t asize) {
+    size_t csize = GET_SIZE(HDRP(bp));
+    remove_node((RBNode*)bp);
+    if (csize - asize >= 2*DSIZE) {
+        PUT(HDRP(bp),      PACK(asize,1));
+        PUT(FTRP(bp),      PACK(asize,1));
+        void *next = NEXT_BLKP(bp);
+        size_t rsz = csize - asize;
+        PUT(HDRP(next),    PACK(rsz,0));
+        PUT(FTRP(next),    PACK(rsz,0));
+        RBNode *node = (RBNode*)next;
+        node->parent = PTR_TO_UINT(NIL);
+        node->left   = PTR_TO_UINT(NIL);
+        node->right  = PTR_TO_UINT(NIL);
+        node->color  = RED;
+        rb_insert(node);
+    } else {
+        PUT(HDRP(bp),      PACK(csize,1));
+        PUT(FTRP(bp),      PACK(csize,1));
+    }
+}
+
+/*-------------------------------------------------------------
+ * Red–Black Tree Utilities (brace style and logic cleaned up)
+ *-------------------------------------------------------------*/
+
+/* Insert node z into the tree rooted at 'root' */
+static void rb_insert(RBNode *z) {
+    RBNode *y = NIL;
+    RBNode *x = root;
+
+    while (x != NIL) {
+        y = x;
+        if (GET_SIZE(HDRP(z)) < GET_SIZE(HDRP(x))) {
+            x = (RBNode *)UINT_TO_PTR(x->left);
+        } else {
+            x = (RBNode *)UINT_TO_PTR(x->right);
+        }
+    }
+
+    z->parent = PTR_TO_UINT(y);
+    if (y == NIL) {
+        root = z;
+    } else if (GET_SIZE(HDRP(z)) < GET_SIZE(HDRP(y))) {
+        y->left = PTR_TO_UINT(z);
+    } else {
+        y->right = PTR_TO_UINT(z);
+    }
+
+    z->left  = PTR_TO_UINT(NIL);
+    z->right = PTR_TO_UINT(NIL);
+    z->color = RED;
+
+    insert_fixup(z);
+}
+
+/* Restore red–black properties after insert */
+static void insert_fixup(RBNode *z) {
+    while ( ((RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(z->parent))->parent))->color == RED ) {
+        RBNode *p = (RBNode *)UINT_TO_PTR(z->parent);
+        RBNode *g = (RBNode *)UINT_TO_PTR(p->parent);
+
+        if (p == (RBNode *)UINT_TO_PTR(g->left)) {
+            RBNode *u = (RBNode *)UINT_TO_PTR(g->right);
+            if (u->color == RED) {
+                p->color = BLACK;
+                u->color = BLACK;
+                g->color = RED;
+                z = g;
+            } else {
+                if (z == (RBNode *)UINT_TO_PTR(p->right)) {
+                    z = p;
+                    left_rotate(z);
+                    p = (RBNode *)UINT_TO_PTR(z->parent);
+                }
+                p->color = BLACK;
+                g->color = RED;
+                right_rotate(g);
+            }
+        } else {
+            RBNode *u = (RBNode *)UINT_TO_PTR(g->left);
+            if (u->color == RED) {
+                p->color = BLACK;
+                u->color = BLACK;
+                g->color = RED;
+                z = g;
+            } else {
+                if (z == (RBNode *)UINT_TO_PTR(p->left)) {
+                    z = p;
+                    right_rotate(z);
+                    p = (RBNode *)UINT_TO_PTR(z->parent);
+                }
+                p->color = BLACK;
+                g->color = RED;
+                left_rotate(g);
+            }
+        }
+    }
+    root->color = BLACK;
+}
+
+/* Rotate subtree left around node x */
+static void left_rotate(RBNode *x) {
+    RBNode *y = (RBNode *)UINT_TO_PTR(x->right);
+
+    /* Turn y's left subtree into x's right subtree */
+    x->right = y->left;
+    if ((RBNode *)UINT_TO_PTR(y->left) != NIL) {
+        ((RBNode *)UINT_TO_PTR(y->left))->parent = PTR_TO_UINT(x);
+    }
+
+    /* Link x's parent to y */
+    y->parent = x->parent;
+    if ((RBNode *)UINT_TO_PTR(x->parent) == NIL) {
+        root = y;
+    } else if (x == (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->left)) {
+        ((RBNode *)UINT_TO_PTR(x->parent))->left = PTR_TO_UINT(y);
+    } else {
+        ((RBNode *)UINT_TO_PTR(x->parent))->right = PTR_TO_UINT(y);
+    }
+
+    /* Put x on y's left */
+    y->left = PTR_TO_UINT(x);
+    x->parent = PTR_TO_UINT(y);
+}
+
+/* Rotate subtree right around node y */
+static void right_rotate(RBNode *y) {
+    RBNode *x = (RBNode *)UINT_TO_PTR(y->left);
+
+    /* Turn x's right subtree into y's left subtree */
+    y->left = x->right;
+    if ((RBNode *)UINT_TO_PTR(x->right) != NIL) {
+        ((RBNode *)UINT_TO_PTR(x->right))->parent = PTR_TO_UINT(y);
+    }
+
+    /* Link y's parent to x */
+    x->parent = y->parent;
+    if ((RBNode *)UINT_TO_PTR(y->parent) == NIL) {
+        root = x;
+    } else if (y == (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(y->parent))->right)) {
+        ((RBNode *)UINT_TO_PTR(y->parent))->right = PTR_TO_UINT(x);
+    } else {
+        ((RBNode *)UINT_TO_PTR(y->parent))->left = PTR_TO_UINT(x);
+    }
+
+    /* Put y on x's right */
+    x->right = PTR_TO_UINT(y);
+    y->parent = PTR_TO_UINT(x);
+}
+
+/* Replace subtree rooted at u with subtree rooted at v */
+static void rb_transplant(RBNode *u, RBNode *v) {
+    if ((RBNode *)UINT_TO_PTR(u->parent) == NIL) {
+        root = v;
+    } else if (u == (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(u->parent))->left)) {
+        ((RBNode *)UINT_TO_PTR(u->parent))->left = PTR_TO_UINT(v);
+    } else {
+        ((RBNode *)UINT_TO_PTR(u->parent))->right = PTR_TO_UINT(v);
+    }
+    v->parent = u->parent;
+}
+
+/* Remove node z from the tree */
+static void remove_node(RBNode *z) {
+    RBNode *y = z;
+    RBNode *x;
+    color_t y_original_color = y->color;
+
+    if ((RBNode *)UINT_TO_PTR(z->left) == NIL) {
+        x = (RBNode *)UINT_TO_PTR(z->right);
+        rb_transplant(z, x);
+    } else if ((RBNode *)UINT_TO_PTR(z->right) == NIL) {
+        x = (RBNode *)UINT_TO_PTR(z->left);
+        rb_transplant(z, x);
+    } else {
+        /* Find z's successor y */
+        y = (RBNode *)UINT_TO_PTR(z->right);
+        while ((RBNode *)UINT_TO_PTR(y->left) != NIL) {
+            y = (RBNode *)UINT_TO_PTR(y->left);
+        }
+        y_original_color = y->color;
+        x = (RBNode *)UINT_TO_PTR(y->right);
+
+        if ((RBNode *)UINT_TO_PTR(y->parent) == z) {
+            x->parent = PTR_TO_UINT(y);
+        } else {
+            rb_transplant(y, x);
+            y->right = z->right;
+            ((RBNode *)UINT_TO_PTR(y->right))->parent = PTR_TO_UINT(y);
+        }
+
+        rb_transplant(z, y);
+        y->left = z->left;
+        ((RBNode *)UINT_TO_PTR(y->left))->parent = PTR_TO_UINT(y);
+        y->color = z->color;
+    }
+
+    if (y_original_color == BLACK) {
+        delete_fixup(x);
+    }
+}
+
+/* Restore red–black properties after delete */
+static void delete_fixup(RBNode *x) {
+    while (x != root && x->color == BLACK) {
+        if (x == (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->left)) {
+            RBNode *w = (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->right);
+            if (w->color == RED) {
+                w->color = BLACK;
+                ((RBNode *)UINT_TO_PTR(x->parent))->color = RED;
+                left_rotate((RBNode *)UINT_TO_PTR(x->parent));
+                w = (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->right);
+            }
+            if (((RBNode *)UINT_TO_PTR(w->left))->color == BLACK &&
+                ((RBNode *)UINT_TO_PTR(w->right))->color == BLACK) {
+                w->color = RED;
+                x = (RBNode *)UINT_TO_PTR(x->parent);
+            } else {
+                if (((RBNode *)UINT_TO_PTR(w->right))->color == BLACK) {
+                    ((RBNode *)UINT_TO_PTR(w->left))->color = BLACK;
+                    w->color = RED;
+                    right_rotate(w);
+                    w = (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->right);
+                }
+                w->color = ((RBNode *)UINT_TO_PTR(x->parent))->color;
+                ((RBNode *)UINT_TO_PTR(x->parent))->color = BLACK;
+                ((RBNode *)UINT_TO_PTR(w->right))->color = BLACK;
+                left_rotate((RBNode *)UINT_TO_PTR(x->parent));
+                x = root;
+            }
+        } else {
+            /* mirror case */
+            RBNode *w = (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->left);
+            if (w->color == RED) {
+                w->color = BLACK;
+                ((RBNode *)UINT_TO_PTR(x->parent))->color = RED;
+                right_rotate((RBNode *)UINT_TO_PTR(x->parent));
+                w = (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->left);
+            }
+            if (((RBNode *)UINT_TO_PTR(w->right))->color == BLACK &&
+                ((RBNode *)UINT_TO_PTR(w->left))->color == BLACK) {
+                w->color = RED;
+                x = (RBNode *)UINT_TO_PTR(x->parent);
+            } else {
+                if (((RBNode *)UINT_TO_PTR(w->left))->color == BLACK) {
+                    ((RBNode *)UINT_TO_PTR(w->right))->color = BLACK;
+                    w->color = RED;
+                    left_rotate(w);
+                    w = (RBNode *)UINT_TO_PTR(((RBNode *)UINT_TO_PTR(x->parent))->left);
+                }
+                w->color = ((RBNode *)UINT_TO_PTR(x->parent))->color;
+                ((RBNode *)UINT_TO_PTR(x->parent))->color = BLACK;
+                ((RBNode *)UINT_TO_PTR(w->left))->color = BLACK;
+                right_rotate((RBNode *)UINT_TO_PTR(x->parent));
+                x = root;
+            }
+        }
+    }
+    x->color = BLACK;
 }
